@@ -2,23 +2,42 @@
 
 Polynomial::Polynomial(ros::NodeHandle& nh)
     : nh_(nh),
-      kin_(),
       z_offset_(0.4),
       max_v_(0.1),
       max_a_(0.1),
       max_ang_v_(0.1),
       max_ang_a_(0.1),
-      max_wheel_velocity_(3.4),
+      max_wheel_v_(3.85),
+      max_leg_v_(0.36),
       derivative_to_optimize(mav_trajectory_generation::derivative_order::ACCELERATION){
         
   // Load params
-  if (!nh_.getParam(ros::this_node::getName() + "/max_v", max_v_)){
-    ROS_WARN("[polynomial_node] param max_v not found");
+  if (!nh_.getParam("/mirrax/velocity/max_lin_vel", max_v_)){
+    ROS_WARN("[polynomial_node] param max_lin_vel not found");
+  }
+  if (!nh_.getParam("/mirrax/velocity/max_ang_vel", max_ang_v_)){
+    ROS_WARN("[polynomial_node] param max_ang_vel not found");
+  }
+  if (!nh_.getParam("/mirrax/velocity/max_lin_acc", max_a_)){
+    ROS_WARN("[polynomial_node] param max_lin_acc not found");
+  }
+  if (!nh_.getParam("/mirrax/velocity/max_leg_vel", max_leg_v_)){
+    ROS_WARN("[polynomial_node] param max_leg_vel not found");
+  }
+  if (!nh_.getParam("/mirrax/velocity/max_wheel_v", max_wheel_v_)){
+    ROS_WARN("[polynomial_node] param max_wheel_v not found");
   }
   if (!nh_.getParam("/zero_waypoint_velocity", zero_waypoint_velocity_)){
     ROS_WARN("[polynomial_node] param zero_waypoint_velocity not found, setting to FALSE");
     zero_waypoint_velocity_ = false;
   }
+  nh_.param("/mirrax/velocity/max_wheel_v", max_wheel_v_, max_wheel_v_);
+
+  // Reduce wheel limit
+  max_wheel_v_ *= 0.88;
+
+  // Instantiate class
+  kin_ = new mirrax::Kinematics(&nh_);
 
   // create publisher for RVIZ markers
   pub_markers_ =
@@ -32,10 +51,6 @@ Polynomial::Polynomial(ros::NodeHandle& nh)
 
   // Subscriber to waypoints
   sub_waypoints_ = nh_.subscribe("/waypoints", 1, &Polynomial::waypointCallback, this);
-
-  // n_.param("/robot_name", robot_name_, robot_name_);
-  kin_.setKinematicParameters("mini");
-  nh_.param("/max_wheel_velocity", max_wheel_velocity_, max_wheel_velocity_);
 
   const bool oneshot = false;
   const bool autostart = false;
@@ -249,7 +264,7 @@ void Polynomial::waypointCallback(
   // for (int i=0; i<msg->points[0].positions.size();i++)
   //   std::cout << "x: " << msg->points[0].positions[i] << std::endl;
   
-  // Generate trajectory
+  // Generate base trajectory
   mav_trajectory_generation::Trajectory trajectory;
   if (!planTrajectory(waypoints, &trajectory))
   {
@@ -257,21 +272,6 @@ void Polynomial::waypointCallback(
     return;
   }
   
-  // Check trajectory feasibility
-  if (!checkFeasibility(trajectory))
-  {
-    ROS_WARN("Trajectory generation failed!");
-    return;
-  }
-
-  ROS_INFO("Trajectory generation success!");
-  publishTrajectory(trajectory);  // for visualization purpose
-
-  // checkRange(trajectory);
-
-  // Trajectory Info
-  std::cout << "Base Trajectory time: " << trajectory.getMaxTime() << std::endl;
-
   // ========================= //
   //    Trajectory for legs    //
   // ========================= //
@@ -299,29 +299,56 @@ void Polynomial::waypointCallback(
                 msg->points[i].positions[5], jtemp;
     waypoints.push_back(waypoint);
   }
-  mav_trajectory_generation::Trajectory trajectory_leg;
-  bool success = false;
-  double leg_velocity_ = 0.36;
 
-  success = planTrajectory(
-        goal_position_, goal_velocity_, start_position_, start_velocity_,
-        waypoints, leg_velocity_, leg_velocity_, &trajectory_leg);
-  if (!success)
+  mav_trajectory_generation::Trajectory trajectory_leg;
+  if ( !planTrajectory(goal_position_, goal_velocity_, 
+                       start_position_, start_velocity_,
+                       waypoints, max_leg_v_, max_leg_v_, 
+                       &trajectory_leg) )
   {
     ROS_WARN("Leg trajectory generation failed!");
     return;
   }
-  std::cout << "Leg Trajectory time: " << trajectory_leg.getMaxTime() << std::endl;
-  
-  // Combine base and leg trajectories
+
+  // ================================== //
+  //   Merge base and leg trajectories  //
+  // ================================== //
   if (!trajectory.getTrajectoryWithAppendedDimension(
             trajectory_leg, &trajectory_))
   {
     ROS_WARN("Trajectory combining failed!");
     return;
   }
-  std::cout << "Combined Trajectory time: " << trajectory_.getMaxTime() << std::endl;
-  std::cout << "D: " << trajectory_.D() << std::endl;
+
+  // Check trajectory feasibility and scale segment time if required
+  ROS_DEBUG("Original Combined Trajectory time: %.3f",trajectory_.getMaxTime());
+  int nattempt = 3;
+  for (int i=0; i<nattempt; i++)
+  {
+    // Breaks out of routine if feasible
+    if (checkFeasibility(trajectory_))
+    {
+      ROS_INFO("Combined trajectory feasible!");
+      break;
+    }
+    // Exits if feasibility fails after number of attemps reached
+    if (i == nattempt-1)
+    {
+      ROS_WARN("Combined trajectory feasibility failed!");
+      return;
+    }
+    ROS_DEBUG("Feasibility check attempt: %d Trajectory time: %.3f", i, trajectory_.getMaxTime());
+  }
+
+  ROS_INFO("Trajectory generation success!");
+  publishTrajectory(trajectory);  // for visualization purpose
+
+  // checkRange(trajectory);
+
+  // Trajectory Info
+  std::cout << "Trajectory timing:" << std::endl;
+  printf("  Base: %.2f\t Leg: %.2f\t Combined: %.2f\n",trajectory.getMaxTime(),trajectory_leg.getMaxTime(),trajectory_.getMaxTime());
+
   // Start sampling trajectory
   publish_timer_.start();
   start_time_ = ros::Time::now();
@@ -471,51 +498,54 @@ bool Polynomial::planTrajectory(const Eigen::VectorXd& goal_pos,
   opt.getTrajectory(&(*trajectory));
   // scale trajectory timing to respect constraint
   trajectory->scaleSegmentTimesToMeetConstraints(v_max, a_max);
-  // std::cout << "bf:" << trajectory->getMaxTime() << std::endl;
-  // std::cout << "af:" << trajectory->getMaxTime() << std::endl;
+
   return true;
 }
 
 bool Polynomial::checkFeasibility(const mav_trajectory_generation::Trajectory& trajectory)
 {
   ROS_INFO("Checking trajectory feasibility ...");
-  // Update robot kinematics i.e. jacobian
-  // kin_.updateKinematics(0,0);
 
   double t_current = 0.0;
-  Eigen::MatrixXd v_cmd(5,1);
+  double w_max = max_wheel_v_;
+  Eigen::VectorXd v_cmd(5);
   Eigen::MatrixXd rot2D(2,2);
 
   while (t_current < trajectory.getMaxTime())
   {
+    // Get position and velocity at sample time
     Eigen::VectorXd p_setpoint = trajectory.evaluate(t_current, mav_trajectory_generation::derivative_order::POSITION);
     Eigen::VectorXd v_setpoint = trajectory.evaluate(t_current, mav_trajectory_generation::derivative_order::VELOCITY);
-
-    // Transform velocity to robot frame
-    double yaw = p_setpoint(5);
+    
+    // Transform velocity to robot frame and remap cmd
+    double yaw = p_setpoint(3);
     rot2D << cos(yaw), sin(yaw), -sin(yaw), cos(yaw);
-    v_cmd << rot2D*v_setpoint.head(2), v_setpoint(5), 0, 0;
+    v_cmd << rot2D*v_setpoint.head(2), 
+             v_setpoint(3), 
+             v_setpoint(4), 
+             v_setpoint(5);
 
-    auto w_cmd = kin_.jac_wheel_*v_cmd;
-    auto w_abs = w_cmd.cwiseAbs();
-    // // std::cout << v_setpoint.head(2).transpose() << std::endl;
-    // // std::cout << vout.transpose() << std::endl;
+    // Calculate required wheel velocity
+    auto w_cmd = kin_->twistToWheelVelocity(v_cmd, p_setpoint(4), p_setpoint(5));
+    auto w_int = (w_cmd.cwiseAbs()).maxCoeff();
     // std::cout << v_cmd.transpose() << std::endl;
     // std::cout << w_cmd.transpose() << std::endl;
-    // // std::cout << w_abs.transpose() << std::endl;
+    // std::cout << w_int.transpose() << std::endl;
     // std::cout << "===========================" << std::endl;
-    // std::cout << abs_w.maxCoeff() << std::endl;
-    auto w_max = w_abs.maxCoeff();
-    if (w_max > max_wheel_velocity_)
-    {
-      ROS_WARN("Wheel velocity exceeded %.2f\n", w_max);
-      return false;
-    }
+    
+    if (w_int > w_max)
+      w_max = w_int;
 
+    // Increase sampling time
     t_current+= 0.1;
   }
-  ROS_INFO("Trajectory feasibile!");
-  
+  if (w_max > max_wheel_v_+0.01)
+  {
+    ROS_WARN("Wheel velocity %.2f exceeds w_lim %.2f", w_max, max_wheel_v_);
+    trajectory_.scaleSegmentTimes(w_max/max_wheel_v_ + 0.05);
+    return false;
+  }
+
   return true;
 }
 
@@ -572,7 +602,7 @@ void Polynomial::checkRange(
     std::cout << "q: " << joint_config.row(i) << std::endl;
     double j5 = joint_config(i,0) * M_PI/180.0;
     double j6 = joint_config(i,1) * M_PI/180.0;
-    kin_.updateKinematics(j5,j6);
+    kin_->updateJacobian(j5,j6);
     checkFeasibility(trajectory);
   }  
 }
@@ -605,12 +635,13 @@ void Polynomial::commandTimerCallback(const ros::TimerEvent&)
     {
       empty_count = 0;
       traj_sampler_.final_trigger_ = true;
-      if (traj_sampler_.current_sample_time_ < trajectory_.getMaxTime())
-        ROS_INFO("Trajectory Sampler: Publishing trajectory setpoints ...");
+      // if (traj_sampler_.current_sample_time_ < trajectory_.getMaxTime())
+      //   ROS_INFO("Trajectory Sampler: Publishing trajectory setpoints ...");
     }
   }
   else if (traj_sampler_.current_sample_time_ <= trajectory_.getMaxTime())
   {
+    ROS_INFO_THROTTLE(5, "Current sample time: %.2f", traj_sampler_.current_sample_time_);
     trajectory_msgs::MultiDOFJointTrajectory msg;
     trajectoryToMsg(traj_sampler_.current_sample_time_, msg);
     pub_command_.publish(msg);

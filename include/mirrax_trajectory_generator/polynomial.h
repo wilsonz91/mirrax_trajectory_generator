@@ -57,8 +57,9 @@ class Polynomial {
   // similar to waypointCallback function. 
   void zeroWaypointVelocity(const trajectory_msgs::JointTrajectory::ConstPtr& msg);
 
-  // Check trajectory feasibiliy
-  // ToDO
+  // Check trajectory feasibiliy. Iterates through trajectory at 0.1s interval.
+  // Trajectory is scaled according to ratio of wheel velocity exceeded. Feasibility
+  // check is repeated for a fixed number of times (not within this function) 
   bool checkFeasibility(const mav_trajectory_generation::Trajectory& trajectory);
 
   // Selects trajectory dimension based on waypoints received
@@ -97,6 +98,8 @@ class Polynomial {
   double max_a_; // m/s^2
   double max_ang_v_; // rad/s
   double max_ang_a_;
+  double max_leg_v_;
+  double max_wheel_v_;
   double z_offset_;
 
   Eigen::VectorXd start_position_;
@@ -107,8 +110,7 @@ class Polynomial {
   // Optimze up to 4th order derivative (POSITION, VELOCITY, ACCELERATION, SNAP)
   const int derivative_to_optimize;
 
-  mirrax::Kinematics kin_;
-  double max_wheel_velocity_;
+  mirrax::Kinematics *kin_;
 
   TrajectorySampler traj_sampler_;
   ros::Timer publish_timer_;
